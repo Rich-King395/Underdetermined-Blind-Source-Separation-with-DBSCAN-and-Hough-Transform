@@ -1,9 +1,12 @@
 from collections import deque
+import itertools
 import math
 
 import numpy as np
-from scipy.signal import stft
+from scipy.signal import istft, stft
 from scipy.spatial import cKDTree
+
+import parameter
 
 
 NOISE_LABEL = -1
@@ -24,7 +27,15 @@ def orient_upper_half(points, eps=1e-12):
     return points * signs[:, None]
 
 
-def compute_stft_matrix(X, fs, nperseg=512, noverlap=384, window="hann"):
+def compute_stft_matrix(
+    X,
+    fs,
+    nperseg=parameter.STFT_NPERSEG,
+    noverlap=parameter.STFT_NOVERLAP,
+    window=parameter.STFT_WINDOW,
+    boundary=parameter.STFT_BOUNDARY,
+    padded=parameter.STFT_PADDED,
+):
     spectra = []
     for channel in X:
         _, _, Zxx = stft(
@@ -33,14 +44,100 @@ def compute_stft_matrix(X, fs, nperseg=512, noverlap=384, window="hann"):
             window=window,
             nperseg=nperseg,
             noverlap=noverlap,
-            boundary=None,
-            padded=False,
+            boundary=boundary,
+            padded=padded,
         )
         spectra.append(Zxx)
     return np.asarray(spectra)
 
 
-def _phase_ratio_mask(Z, epsilon=0.06, real_floor=1e-8):
+def reconstruct_from_stft_matrix(
+    S_stft,
+    fs,
+    nperseg=parameter.STFT_NPERSEG,
+    noverlap=parameter.STFT_NOVERLAP,
+    window=parameter.STFT_WINDOW,
+    length=None,
+):
+    recovered = []
+    for source_stft in S_stft:
+        _, source = istft(
+            source_stft,
+            fs=fs,
+            window=window,
+            nperseg=nperseg,
+            noverlap=noverlap,
+            input_onesided=True,
+            boundary=True,
+        )
+        if length is not None:
+            if len(source) < length:
+                source = np.pad(source, (0, length - len(source)))
+            source = source[:length]
+        recovered.append(source.real)
+    return np.asarray(recovered)
+
+
+def recover_sources_min_residual(
+    X,
+    A_hat,
+    fs,
+    nperseg=parameter.STFT_NPERSEG,
+    noverlap=parameter.STFT_NOVERLAP,
+    window=parameter.STFT_WINDOW,
+    active_count=parameter.ACTIVE_COUNT,
+):
+    observation_count, source_count = A_hat.shape
+    if active_count is None:
+        active_count = max(1, observation_count - 1)
+    if active_count < 1 or active_count > observation_count:
+        raise ValueError("active_count must be between 1 and the number of observations.")
+    if active_count > source_count:
+        raise ValueError("active_count cannot exceed the estimated source count.")
+
+    Z = compute_stft_matrix(X, fs=fs, nperseg=nperseg, noverlap=noverlap, window=window)
+    flat_observations = Z.reshape(observation_count, -1)
+    flat_sources = np.zeros((source_count, flat_observations.shape[1]), dtype=complex)
+    best_errors = np.full(flat_observations.shape[1], np.inf)
+    best_labels = np.full(flat_observations.shape[1], -1, dtype=int)
+
+    combinations = list(itertools.combinations(range(source_count), active_count))
+    for combination_index, indices in enumerate(combinations):
+        A_sub = A_hat[:, indices]
+        coefficients = np.linalg.pinv(A_sub) @ flat_observations
+        residual = flat_observations - A_sub @ coefficients
+        errors = np.sum(np.abs(residual) ** 2, axis=0)
+        update = errors < best_errors
+
+        if np.any(update):
+            flat_sources[:, update] = 0
+            flat_sources[np.ix_(indices, update)] = coefficients[:, update]
+            best_errors[update] = errors[update]
+            best_labels[update] = combination_index
+
+    S_stft = flat_sources.reshape(source_count, Z.shape[1], Z.shape[2])
+    S_hat = reconstruct_from_stft_matrix(
+        S_stft,
+        fs=fs,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        window=window,
+        length=X.shape[1],
+    )
+    diagnostics = {
+        "active_count": int(active_count),
+        "combinations": [tuple(int(index) for index in indices) for indices in combinations],
+        "assignment_counts": {
+            tuple(int(index) for index in combinations[combination_index]): int(np.count_nonzero(best_labels == combination_index))
+            for combination_index in range(len(combinations))
+        },
+        "mean_residual": float(np.mean(best_errors)),
+        "source_stft": S_stft,
+    }
+    return S_hat, diagnostics
+
+
+def _phase_ratio_mask(Z, epsilon=parameter.PHASE_EPSILON, real_floor=1e-8):
     real = Z.real
     imag = Z.imag
     valid = np.all(np.abs(real) > real_floor, axis=0)
@@ -54,7 +151,7 @@ def _phase_ratio_mask(Z, epsilon=0.06, real_floor=1e-8):
     return mask
 
 
-def _phase_angle_mask(Z, epsilon=0.06):
+def _phase_angle_mask(Z, epsilon=parameter.PHASE_EPSILON):
     phases = np.angle(Z)
     mask = np.ones(Z.shape[1:], dtype=bool)
     channel_count = Z.shape[0]
@@ -67,9 +164,9 @@ def _phase_angle_mask(Z, epsilon=0.06):
 
 def detect_single_source_points(
     Z,
-    epsilon=0.06,
-    energy_fraction=0.1,
-    phase_rule="angle",
+    epsilon=parameter.PHASE_EPSILON,
+    energy_fraction=parameter.ENERGY_FRACTION,
+    phase_rule=parameter.PHASE_RULE,
 ):
     if phase_rule == "ratio":
         mask = _phase_ratio_mask(Z, epsilon=epsilon)
@@ -159,7 +256,11 @@ def cluster_centers(points, labels):
     return orient_upper_half(np.asarray(centers))
 
 
-def hough_refine_2d(points, beta=180, rho_tolerance=0.015):
+def hough_refine_2d(
+    points,
+    beta=parameter.HOUGH_BETA,
+    rho_tolerance=parameter.HOUGH_RHO_TOLERANCE,
+):
     points = orient_upper_half(points)
     theta_values = np.linspace(0, np.pi, beta, endpoint=False)
     normal_vectors = np.column_stack([np.sin(theta_values), np.cos(theta_values)])
@@ -179,15 +280,17 @@ def hough_refine_2d(points, beta=180, rho_tolerance=0.015):
 def estimate_mixing_matrix(
     X,
     fs,
-    nperseg=512,
-    noverlap=384,
-    epsilon=0.06,
-    energy_fraction=0.1,
-    min_samples=10,
-    eps=None,
-    beta=180,
-    rho_tolerance=0.015,
-    phase_rule="angle",
+    nperseg=parameter.STFT_NPERSEG,
+    noverlap=parameter.STFT_NOVERLAP,
+    epsilon=parameter.PHASE_EPSILON,
+    energy_fraction=parameter.ENERGY_FRACTION,
+    min_samples=parameter.DBSCAN_MIN_SAMPLES,
+    eps=parameter.DBSCAN_EPS,
+    beta=parameter.HOUGH_BETA,
+    rho_tolerance=parameter.HOUGH_RHO_TOLERANCE,
+    phase_rule=parameter.PHASE_RULE,
+    min_cluster_size=parameter.MIN_CLUSTER_SIZE,
+    min_cluster_fraction=parameter.MIN_CLUSTER_FRACTION,
 ):
     Z = compute_stft_matrix(X, fs=fs, nperseg=nperseg, noverlap=noverlap)
     tf_vectors, single_source_mask = detect_single_source_points(
@@ -207,6 +310,15 @@ def estimate_mixing_matrix(
         eps = estimate_eps(points, min_samples=min_samples)
 
     labels = dbscan(points, eps=eps, min_samples=min_samples)
+    if min_cluster_size is None:
+        min_cluster_size = max(2 * min_samples, int(np.ceil(min_cluster_fraction * len(points))))
+
+    for label in sorted(np.unique(labels)):
+        if label == NOISE_LABEL:
+            continue
+        if np.count_nonzero(labels == label) < min_cluster_size:
+            labels[labels == label] = NOISE_LABEL
+
     cluster_labels = [label for label in sorted(np.unique(labels)) if label != NOISE_LABEL]
     if not cluster_labels:
         raise RuntimeError("DBSCAN did not find any clusters; try increasing eps or lowering min_samples.")
@@ -234,6 +346,8 @@ def estimate_mixing_matrix(
         "point_count": int(len(points)),
         "eps": float(eps),
         "min_samples": int(min_samples),
+        "min_cluster_size": int(min_cluster_size),
+        "min_cluster_fraction": float(min_cluster_fraction),
         "labels": labels,
         "cluster_count": int(len(cluster_labels)),
         "cluster_labels": [int(label) for label in cluster_labels],
